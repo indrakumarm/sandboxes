@@ -1,4 +1,4 @@
-# The Rebirth of the Sandbox — A Modern Guide to Isolation Technologies
+# The Rebirth of the Sandbox — An Introduction to Modern Isolation Technologies
 
 ## What Is a Sandbox?
 
