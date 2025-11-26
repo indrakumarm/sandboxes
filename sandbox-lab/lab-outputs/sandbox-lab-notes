@@ -1,0 +1,451 @@
+####Below will create isolated environment with /opt/alpinr-root mounted under it
+sudo bwrap --unshare-all --new-session   --ro-bind /opt/alpine-root /   --tmpfs /tmp   --proc /proc   --dev /dev   /bin/sh
+
+####Inside sanbox:
+    ##process inside the namespace
+    ~ # ps -ef     # only your shell
+    PID   USER     TIME  COMMAND
+        1 root      0:00 bwrap --unshare-all --new-session --ro-bind /opt/alpine-root / --tmpfs /tmp --proc /proc --dev /d
+        2 root      0:00 /bin/sh
+        3 root      0:00 ps -ef
+
+    ###touching file under / fails, as mounted as readonly
+    ~ # touch /outside   
+    touch: /outside: Read-only file system
+    ~ # 
+
+#####on host
+ ps -ef | grep sh
+root           1       0  0 Nov18 ?        00:00:08 /sbin/init splash
+root           7       2  0 Nov18 ?        00:00:00 [kworker/R-slub_flushwq]
+root        1963       1  0 Nov18 ?        00:00:00 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
+indm        3261    3053  0 Nov18 ?        00:00:00 /usr/libexec/gcr-ssh-agent --base-dir /run/user/1000/gcr
+indm        3345    3330  0 Nov18 ?        00:00:00 /usr/bin/dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf --nofork --print-address 11 --address=unix:path=/run/user/1000/at-spi/bus
+indm        3348    3053  0 Nov18 ?        00:37:08 /usr/bin/gnome-shell
+indm        3506    3053  0 Nov18 ?        00:00:00 /usr/libexec/gnome-shell-calendar-server
+indm        3524    3053  0 Nov18 ?        00:00:00 /usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.Shell.Notifications
+indm        3577    3053  0 Nov18 ?        00:00:08 /usr/libexec/gsd-sharing
+indm        3891    3281  0 Nov18 ?        00:00:00 /usr/libexec/gvfsd-trash --spawner :1.20 /org/gtk/gvfs/exec_spaw/0
+indm        3961    3053  0 Nov18 ?        00:00:00 /usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.ScreenSaver
+indm        4598    3053  0 Nov18 ?        00:00:00 /opt/google/chrome/chrome_crashpad_handler --monitor-self --monitor-self-annotation=ptype=crashpad-handler --database=/home/indm/.config/google-chrome/Crash Reports --metrics-dir=/home/indm/.config/google-chrome --url=https://clients2.google.com/cr/report --annotation=channel= --annotation=lsb-release=Ubuntu 24.04.3 LTS --annotation=plat=Linux --annotation=prod=Chrome_Linux --annotation=ver=140.0.7339.127 --initial-client-fd=5 --shared-client-connection
+
+###Running commands from the sandbox
+sudo bwrap --unshare-all --new-session   --ro-bind /opt/alpine-root /   --tmpfs /tmp   --proc /proc   --dev /dev   /bin/sh -c "echo hello"
+hello
+
+##Creating python operator (sanbox_runner.py)
+    import asyncio
+
+    async def run(code):
+        proc = await asyncio.create_subprocess_exec(
+            "bwrap", "--unshare-all", "--new-session",
+            "--ro-bind", "/opt/alpine-root", "/",
+            "--tmpfs", "/tmp",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "/bin/sh", "-c", code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        return out.decode(), err.decode()
+
+    print(asyncio.run(run("echo 'sandbox OK'")))
+
+# python3 sanbox_runner.py 
+('sandbox OK\n', '')
+
+##Creating workspace and mounting
+On Host:
+WORKDIR=$(mktemp -d) &&
+# echo 'echo "Inside sandbox";touch /workspace/testfile;ls -la /workspace'> "$WORKDIR/script.sh"
+
+chmod 700 "$WORKDIR/script.sh
+# echo $WORKDIR
+/tmp/tmp.GcDaXXCKi8
+
+##Mounting above $WORKDIR on sandbox and executing $WORKDIR/script.sh
+Root FS: --ro-bind /opt/alpine-root /
+→ Isolated root filesystem (container-like), but read-only so sandbox cannot alter the root.
+Workspace:
+--bind "$WORKDIR" /workspace
+→ Writable sandbox area where script can create files.
+Ephemeral tmpfs
+--tmpfs /tmp
+→ Clean, private /tmp for temp file creation.
+
+Together, we get:
+Read-only OS
+Writable working directory
+No access to host filesystem
+Private tmp
+Private namespaces
+Perfect for LLM + code execution sandboxes.
+
+bwrap --unshare-all --new-session \
+  --ro-bind /opt/alpine-root / \
+  --bind "$WORKDIR" /workspace \
+  --tmpfs /tmp \
+  --proc /proc \
+  --dev /dev \
+  /bin/sh /workspace/script.sh
+Inside sandbox
+total 12
+drwx------    2 root     root          4096 Nov 24 13:42 .
+drwxr-xr-x   20 root     root          4096 Nov 24 13:28 ..
+-rwx------    1 root     root            67 Nov 24 13:42 script.sh
+-rw-r--r--    1 root     root             0 Nov 24 13:42 testfile
+
+###Full orchestraor
+import asyncio, tempfile, os
+
+def pp(out: str, err: str):
+    print("\n" + "="*20 + " STDOUT " + "="*20)
+    print(out if out.strip() else "<empty>")
+    print("="*20 + " STDERR " + "="*20)
+    print(err if err.strip() else "<empty>")
+    print("="*49 + "\n")
+
+async def execute(code):
+    with tempfile.TemporaryDirectory() as work:
+        script = os.path.join(work, "r.sh")
+        open(script, "w").write(code)
+
+        cmd = [
+            "bwrap", "--unshare-all", "--new-session",
+            "--ro-bind", "/opt/alpine-root", "/",
+            "--bind", work, "/workspace",
+            "--tmpfs", "/tmp",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "/bin/sh", "/workspace/r.sh"
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        return out.decode(), err.decode()
+
+if __name__ == '__main__':
+    code = """#!/bin/sh
+echo "Inside sandbox via orchestrator"
+id
+touch /workspace/pytestfile
+ls -la /workspace
+"""
+    out, err = asyncio.run(execute(code))
+    pp(out, err)
+
+
+
+# python3 full_orchestrator.py 
+
+==================== STDOUT ====================
+Inside sandbox via orchestrator
+uid=0(root) gid=0(root) groups=0(root)
+total 12
+drwx------    2 root     root          4096 Nov 24 13:53 .
+drwxr-xr-x   20 root     root          4096 Nov 24 13:28 ..
+-rw-r--r--    1 root     root             0 Nov 24 13:53 pytestfile
+-rw-r--r--    1 root     root            98 Nov 24 13:53 r.sh
+
+==================== STDERR ====================
+<empty>
+=================================================
+
+Why to use cgroups for a sandbox ??
+
+Without cgroups, any program inside your bwrap sandbox could:
+
+consume all your RAM → cause OOM on host
+
+spawn thousands of processes → fork bomb
+
+burn 100% CPU → starve system
+
+create too many threads
+
+So production sandboxes must apply cgroup limits.
+
+How cgroups v2 works
+Everything happens inside:
+/sys/fs/cgroup/
+create sub dir under it
+/sys/fs/cgroup/<sandbox-id>
+
+inside this directory, write limit files
+| File         | Meaning                     |
+| ------------ | --------------------------- |
+| memory.max   | max memory allowed          |
+| cpu.max      | CPU quota                   |
+| pids.max     | max number of processes     |
+| cgroup.procs | processes inside this group |
+
+echo 200M | sudo tee /sys/fs/cgroup/sbx1/memory.max
+
+
+
+>> for cgroup testing
+sudo systemd-run --scope --unit=test-sbx \
+  -p MemoryMax=200M \
+  -p MemorySwapMax=0 \
+  -p MemoryAccounting=yes \
+  bwrap --unshare-all --new-session \
+    --ro-bind /opt/alpine-root / \
+    --tmpfs /tmp \
+    --proc /proc \
+    --dev /dev \
+    /bin/sh
+Running as unit: test-sbx.scope; invocation ID: e110f899fca9477dad604a027c64a3fb
+/bin/sh: can't access tty; job control turned off
+~ # sh -c '
+> data=""
+> i=0
+> while true; do
+>     chunk=$(dd if=/dev/zero bs=1048576 count=10 2>/dev/null | tr "\000" "x")
+>     data="${data}${chunk}"
+>     i=$((i + 10))
+>     echo "Allocated: ${i}MB"
+> done
+> '
+Allocated: 10MB
+Allocated: 20MB
+Allocated: 30MB
+Allocated: 40MB
+Allocated: 50MB
+Allocated: 60MB
+Allocated: 70MB
+Allocated: 80MB
+Allocated: 90MB
+Killed
+~ # Terminated
+
+>> on host system messages for oom
+[Mon Dec  1 03:14:57 2025] Tasks state (memory values in pages):
+[Mon Dec  1 03:14:57 2025] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[Mon Dec  1 03:14:57 2025] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=test-sbx.scope,mems_allowed=0,oom_memcg=/system.slice/test-sbx.scope,task_memcg=/system.slice/test-sbx.scope,task=sh,pid=152243,uid=0
+[Mon Dec  1 03:14:57 2025] Memory cgroup out of memory: Killed process 152243 (sh) total-vm:288360kB, anon-rss:203088kB, file-rss:896kB, shmem-rss:0kB, UID:0 pgtables:448kB oom_score_adj:200
+^G^F^C
+
+
+
+Seccomp:
+#include <seccomp.h>
+#include <unistd.h>
+#include <stdio.h>
+
+int main() {
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
+    if (ctx == NULL) {
+        perror("seccomp_init");
+        return 1;
+    }
+
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
+
+    if (seccomp_load(ctx) < 0) {
+        perror("seccomp_load");
+        return 1;
+    }
+
+    execl("/bin/sh", "sh", NULL);
+    perror("execl");
+    return 1;
+}
+Install libseccomp
+
+Debian/Ubuntu:
+
+sudo apt install libseccomp-dev gcc
+
+cat block_syscalls.c
+#include <seccomp.h>
+#include <stdio.h>
+
+int main() {
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+    
+    // Block these syscalls
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(mkdir), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(mkdirat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(chmod), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(fchmod), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(fchmodat), 0);
+    
+    seccomp_export_bpf(ctx, 1);  // Export to stdout
+    seccomp_release(ctx);
+    return 0;
+}
+
+ gcc block_syscalls.c -o gen_filter -lseccomp
+    ./gen_filter > /tmp/block.bpf
+
+root@indm-Precision-5540:sandbox-lab# bwrap --ro-bind / /       --dev-bind /dev /dev       --tmpfs /tmp       --proc /proc       --seccomp 3 3< /tmp/block.bpf    /bin/bash
+root@indm-Precision-5540:sandbox-lab# bwrap --ro-bind /usr /usr \
+      --ro-bind /lib /lib \
+      --ro-bind /lib64 /lib64 \
+      --ro-bind /bin /bin \
+      --ro-bind /sbin /sbin \
+      --tmpfs /tmp \
+      --proc /proc \
+      --dev /dev \
+      --seccomp 3 3< /tmp/block.bpf \
+      /bin/bash
+bash: /tmp/block.bpf: No such file or      < mkdir failed
+root@indm-Precision-5540:sandbox-lab# mkdir /tmp/tt
+Bad system call (core dumped)
+
+
+[worker-1] starting sandbox...
+[worker-2] starting sandbox...
+[worker-0] sandbox ready.
+[worker-0] running job 0: echo job-0; id; ls /workspace
+[worker-1] sandbox ready.
+[worker-1] running job 1: echo job-1; id; ls /workspace
+[worker-2] sandbox ready.
+[worker-2] running job 2: echo job-2; id; ls /workspace
+[worker-0] running job 3: echo job-3; id; ls /workspace
+
+=== RESULT job 0 ===
+job-0
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-1] running job 4: echo job-4; id; ls /workspace
+
+=== RESULT job 1 ===
+job-1
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-2] running job 5: echo job-5; id; ls /workspace
+
+=== RESULT job 2 ===
+job-2
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-0] running job 6: echo job-6; id; ls /workspace
+
+=== RESULT job 3 ===
+job-3
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-1] running job 7: echo job-7; id; ls /workspace
+
+=== RESULT job 4 ===
+job-4
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-2] running job 8: echo job-8; id; ls /workspace
+
+=== RESULT job 5 ===
+job-5
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-0] running job 9: echo job-9; id; ls /workspace
+
+=== RESULT job 6 ===
+job-6
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+
+=== RESULT job 7 ===
+job-7
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+
+=== RESULT job 8 ===
+job-8
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+
+=== RESULT job 9 ===
+job-9
+uid=0(root) gid=0(root) groups=0(root)
+README.md
+Vagrantfile
+Vagrantfile.try
+docs
+mac
+tools
+ubuntu
+worker_pool.py
+
+[worker-1] stopping sandbox...
+[worker-2] stopping sandbox...
+[worker-0] stopping sandbox...
